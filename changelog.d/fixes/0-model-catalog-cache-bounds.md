@@ -1,1 +1,0 @@
-- **fix(api):** Bound model catalog response and last-good caches by entry count and retained string bytes, preventing distinct pagination cursors from accumulating catalog responses.
