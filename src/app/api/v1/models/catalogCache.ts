@@ -166,7 +166,6 @@ class BoundedCatalogCache {
   }
 
   set(key: string, entry: CachedCatalog): void {
-    this.delete(key);
     // Two bytes per UTF-16 code unit bounds V8's one-/two-byte string storage.
     // Entry-count limits bound object/Map overhead independently of string size.
     const bytes =
@@ -178,6 +177,8 @@ class BoundedCatalogCache {
           0
         ));
     if (bytes > CATALOG_CACHE_MAX_BYTES) return;
+    // An oversized refresh must preserve an existing bounded last-good entry.
+    this.delete(key);
     while (
       this.items.size >= CATALOG_CACHE_MAX_ENTRIES ||
       this.bytes + bytes > CATALOG_CACHE_MAX_BYTES

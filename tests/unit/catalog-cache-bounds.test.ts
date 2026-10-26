@@ -8,6 +8,7 @@ import { createTempDataDir } from "../_setup/tempDataDir.ts";
 
 const { cleanup } = createTempDataDir("omniroute-catalog-bounds-");
 const cache = await import("../../src/app/api/v1/models/catalogCache.ts");
+const readCache = await import("../../src/lib/db/readCache.ts");
 
 const headers = { corsHeaders: {}, diagnosticHeaders: {} };
 function request(after: string) {
@@ -33,7 +34,6 @@ test("retention regression: response cache evicts after 64 distinct unknown curs
 });
 
 const MAX_BYTES = 16 * 1024 * 1024;
-const readCache = await import("../../src/lib/db/readCache.ts");
 function assertBounded() {
   for (const stats of Object.values(cache.__getCatalogCacheStatsForTest())) {
     assert.ok(stats.entries <= 64);
@@ -273,3 +273,38 @@ test("parallel identical requests still coalesce under cache pressure", async ()
   assert.equal(cache.__getCatalogBuilderRunsForTest(), 65);
   assertBounded();
 });
+
+for (const oversizedPart of ["body", "headers"] as const) {
+  test(`oversized ${oversizedPart} refresh preserves an existing last-good response`, async () => {
+    const key = `oversized-refresh-${oversizedPart}`;
+    assert.equal(await resolve(key, "prior-last-good"), "prior-last-good");
+    const prior = cache.__getCatalogCacheStatsForTest().lastGood;
+    cache.__expireCatalogCacheForTest(60_000);
+    const huge = "x".repeat(9 * 1024 * 1024);
+    const replacement: CatalogPayload = {
+      ...payload(oversizedPart === "body" ? huge : "new-large-header"),
+      headers: oversizedPart === "headers" ? { etag: '"new"', "x-large": huge } : { etag: '"new"' },
+    };
+    const retainedSnapshots: Array<{ entries: number; bytes: number }> = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await cache.resolveCachedCatalogResponse(
+        request(key),
+        headers,
+        async () => replacement
+      );
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), replacement.body);
+      assert.equal(cache.__getCatalogBuilderRunsForTest(), attempt + 2);
+      assert.equal(cache.__getCatalogCacheStatsForTest().cache.entries, 0);
+      retainedSnapshots.push(cache.__getCatalogCacheStatsForTest().lastGood);
+      assertBounded();
+    }
+    const fallback = await timeoutResponse(key);
+    assert.equal(fallback.status, 200);
+    assert.equal(await fallback.text(), "prior-last-good");
+    assert.equal(fallback.headers.get("x-omniroute-catalog"), "last-good");
+    assert.equal(fallback.headers.get("etag"), '"fixture"');
+    for (const snapshot of retainedSnapshots) assert.deepEqual(snapshot, prior);
+    assertBounded();
+  });
+}
