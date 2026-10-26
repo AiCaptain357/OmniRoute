@@ -11,7 +11,7 @@
  * import edge.
  */
 
-import type { PendingRequestOwner } from "@/lib/usage/usageHistory";
+import type { PendingRequestOwner } from "../../utils/pendingRequestCleanup.ts";
 import { STREAM_DISCONNECT_GRACE_PERIOD_MS } from "../../config/constants.ts";
 import type { StreamControllerOptions } from "../../utils/streamControllerTypes.ts";
 import { createStreamController } from "../../utils/streamHandler.ts";

@@ -65,8 +65,11 @@ test("createSSETransformStreamWithLogger preserves the legacy buffer slot and op
   if (declarations.length === 19) {
     assert.match(
       declarations[18],
-      /^pendingRequestId\s*:\s*(?:string\s*\|\s*null|null\s*\|\s*string|PendingRequestIdentity\s*\|\s*null)\s*=\s*null$/
+      /^pendingRequestId\s*:\s*(?:string\s*\|\s*null|null\s*\|\s*string|(?:PendingRequestIdentity|StreamPendingRequestIdentity)\s*\|\s*null)\s*=\s*null$/
     );
+    if (declarations[18].includes("StreamPendingRequestIdentity")) {
+      assert.match(src, /type StreamPendingRequestIdentity = PendingRequestIdentity \| false;/);
+    }
   }
 });
 
@@ -87,10 +90,15 @@ test("GLM translateSseResponse fills the buffer-size slot with the named constan
   const params = splitTopLevel(header).map((param) => param.split(/[:=]/)[0].trim());
   const args = splitTopLevel(call);
 
-  assert.equal(args.length, 18, `GLM must preserve its legacy 18-argument call:\n${call}`);
+  assert.equal(
+    args.length,
+    19,
+    `GLM must opt out of pending ownership after its legacy buffer slot:\n${call}`
+  );
   assert.equal(params[17], "streamBufferBytes");
-  assert.deepEqual(params.slice(args.length), params.length === 18 ? [] : ["pendingRequestId"]);
-  assert.equal(args.at(-1), "GLM_STREAM_BUFFER_BYTES");
+  assert.equal(params[18], "pendingRequestId");
+  assert.equal(args[17], "GLM_STREAM_BUFFER_BYTES");
+  assert.equal(args[18], "false");
   assert.equal(args[params.indexOf("suppressThinkClose")], "suppressThinkClose");
   assert.match(src, /const GLM_STREAM_BUFFER_BYTES = 65536;/);
 });

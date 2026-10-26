@@ -1,4 +1,4 @@
-import type { PendingRequestIdentity } from "@/lib/usage/usageHistory";
+import type { PendingRequestIdentity } from "./pendingRequestCleanup.ts";
 
 /** Callback contracts for the stream controller lifecycle. */
 type StreamDisconnectEvent = {

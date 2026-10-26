@@ -5,10 +5,12 @@ import { createTempDataDir } from "../_setup/tempDataDir.ts";
 const { cleanup } = createTempDataDir("omniroute-pending-terminal-");
 const history = await import("../../src/lib/usage/usageHistory.ts");
 const completed = await import("../../src/lib/usage/completedRequestDetails.ts");
+const { translateSseResponse } = await import("../../open-sse/executors/glm.ts");
 const { runStreamingTail } = await import("../../open-sse/handlers/chatCore/streamingTail.ts");
 const costRules = await import("../../src/domain/costRules.ts");
 const { STREAM_IDLE_TIMEOUT_MS } = await import("../../open-sse/config/constants.ts");
-const { createPassthroughStreamWithLogger } = await import("../../open-sse/utils/stream.ts");
+const { createPassthroughStreamWithLogger, PENDING_REQUEST_CLEARED_MARKER } =
+  await import("../../open-sse/utils/stream.ts");
 const { createRequestLogger } = await import("../../open-sse/utils/requestLogger.ts");
 await import("../../open-sse/translator/bootstrap.ts");
 const { translateRequest } = await import("../../open-sse/translator/index.ts");
@@ -74,12 +76,13 @@ async function stream(
     currentConnectionId?: string | null;
     pendingConnectionId?: string | null;
     pendingRequestOwner?: FixturePendingIdentity;
-    lifecycle?: "cancel" | "abort" | "error";
+    lifecycle?: "cancel" | "abort" | "error" | "translated-error";
     readinessFailure?: boolean;
     model?: string;
     provider?: string;
     wire?: string;
     reqLogger?: Awaited<ReturnType<typeof createRequestLogger>>;
+    glmTransport?: boolean;
   } = {}
 ) {
   const model = options.model ?? MODEL;
@@ -115,7 +118,11 @@ async function stream(
       ? new ReadableStream({
           start(controller) {
             providerStream = controller;
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(firstEvent)}\n\n`));
+            controller.enqueue(
+              new TextEncoder().encode(
+                options.glmTransport ? GLM_PARTIAL_WIRE : `data: ${JSON.stringify(firstEvent)}\n\n`
+              )
+            );
           },
         })
       : wire;
@@ -184,7 +191,7 @@ async function stream(
     bodyForCacheWrite: body,
     clientResponseFormat: options.clientResponseFormat ?? "openai",
     targetFormat: options.targetFormat ?? "openai",
-    apiKeyInfo: { id: API_KEY_ID },
+    apiKeyInfo: options.glmTransport ? {} : { id: API_KEY_ID },
     provider,
     model,
     effectiveModel: model,
@@ -208,7 +215,13 @@ async function stream(
           status: 502,
           headers: { "content-type": "application/json" },
         })
-      : new Response(providerBody, { headers: { "content-type": "text/event-stream" } }),
+      : options.glmTransport
+        ? translateSseResponse(
+            new Response(providerBody, { headers: { "content-type": "text/event-stream" } }),
+            provider,
+            model
+          )
+        : new Response(providerBody, { headers: { "content-type": "text/event-stream" } }),
     providerHeaders: {},
     translatedBody: body,
     finalBody: body,
@@ -269,6 +282,14 @@ async function stream(
     } else {
       if (options.lifecycle === "error") {
         providerStream?.error(new Error("fixture upstream failure"));
+      }
+      if (options.lifecycle === "translated-error") {
+        providerStream?.enqueue(
+          new TextEncoder().encode(
+            'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"GLM translated failure"}}\n\n'
+          )
+        );
+        providerStream?.close();
       }
       text = await outcome.result.response.text();
     }
@@ -1385,3 +1406,191 @@ test("legacy preview update rechecks its selected detail after normalization wit
   assert.equal(history.finalizePendingRequestById(pair.ownerA, { status: 200 }), true);
   assert.equal(history.getPendingRetainedBytes(), 0);
 });
+
+const GLM_PROVIDER = "glm";
+const GLM_MODEL = "glm-5";
+const GLM_KEY = GLM_MODEL + " (" + GLM_PROVIDER + ")";
+const GLM_PARTIAL_WIRE = [
+  [
+    "message_start",
+    {
+      type: "message_start",
+      message: {
+        id: "msg_glm",
+        type: "message",
+        role: "assistant",
+        model: GLM_MODEL,
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    },
+  ],
+  [
+    "content_block_start",
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+  ],
+  [
+    "content_block_delta",
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "actual GLM answer" },
+    },
+  ],
+]
+  .map(([event, data]) => "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n")
+  .join("");
+const GLM_WIRE =
+  GLM_PARTIAL_WIRE +
+  [
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    [
+      "message_delta",
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 2 },
+      },
+    ],
+    ["message_stop", { type: "message_stop" }],
+  ]
+    .map(([event, data]) => "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n")
+    .join("");
+
+for (const indexed of [false, true]) {
+  for (const mode of [
+    "success",
+    "bookkeeping",
+    "idle",
+    "error",
+    "translated-error",
+    "cancel",
+  ] as const) {
+    test(
+      "real GLM " +
+        (indexed ? "indexed" : "model-only") +
+        " " +
+        mode +
+        " preserves a concurrent admission",
+      async (t) => {
+        const a = history.trackPendingRequest(
+          GLM_MODEL,
+          GLM_PROVIDER,
+          indexed ? CONN : null,
+          true,
+          { clientRequest: { attempt: "A" } }
+        );
+        const b = history.trackPendingRequest(
+          GLM_MODEL,
+          GLM_PROVIDER,
+          indexed ? CONN : null,
+          true,
+          { clientRequest: { attempt: "B" } }
+        );
+        const survivor = b ? history.getPendingById().get(b) : undefined;
+        const survivorBytes = b ? history.getPendingRetainedBytes() / 2 : 0;
+        assert.equal(history.getPendingRequests().byModel[GLM_KEY], 2);
+        const intervals: Array<() => void> = [];
+        const original = globalThis.setInterval;
+        t.mock.method(globalThis, "setInterval", (callback: () => void, delay: number) => {
+          if (delay === 10_000) intervals.push(callback);
+          return original(callback, delay);
+        });
+        t.mock.method(console, "warn", () => {});
+        t.mock.method(console, "debug", () => {});
+        const result = await stream(
+          a ?? "generated-glm-" + mode,
+          mode === "bookkeeping" || mode === "idle",
+          {
+            rawConnectionId: indexed ? CONN : null,
+            pendingConnectionId: indexed ? CONN : null,
+            currentConnectionId: indexed ? CONN : null,
+            provider: GLM_PROVIDER,
+            model: GLM_MODEL,
+            wire: GLM_WIRE,
+            glmTransport: true,
+            lifecycle:
+              mode === "error" || mode === "translated-error" || mode === "cancel"
+                ? mode
+                : undefined,
+            idle:
+              mode === "idle"
+                ? () => {
+                    assert.ok(intervals[0], "real inner GLM stream arms its idle watchdog");
+                    const now = Date.now();
+                    t.mock.method(Date, "now", () => now + STREAM_IDLE_TIMEOUT_MS + 1_000);
+                    intervals[0]();
+                  }
+                : undefined,
+          }
+        );
+        if (mode === "success" || mode === "bookkeeping")
+          assert.match(result.text, /actual GLM answer/);
+        assert.equal(history.getPendingRequests().byModel[GLM_KEY], 1);
+        assert.equal(history.getPendingRetainedBytes(), survivorBytes);
+        if (b) {
+          assert.equal(history.getPendingById().get(b), survivor);
+          assert.equal(history.getPendingRequests().byAccount[CONN]?.[GLM_KEY], 1);
+          assert.equal(history.getPendingById().has(a!), false);
+          const state = history.getPendingRequests() as ReturnType<
+            typeof history.getPendingRequests
+          > & { details: Record<string, Record<string, Array<{ id: string }>>> };
+          assert.deepEqual(
+            state.details[CONN]?.[GLM_KEY]?.map((d) => d.id),
+            [b]
+          );
+        }
+        result.controller.handleDisconnect("duplicate GLM terminal");
+        result.outcome.carry.onPipelineStreamError?.({
+          message: "duplicate GLM terminal",
+          statusCode: 502,
+        });
+        assert.equal(history.getPendingRequests().byModel[GLM_KEY], 1);
+        assert.equal(history.getPendingRetainedBytes(), survivorBytes);
+        assert.equal(result.released(), 1);
+      }
+    );
+  }
+}
+
+for (const indexed of [false, true]) {
+  test(
+    "GLM transport error leaves outer cleanup unclaimed for " +
+      (indexed ? "indexed" : "model-only") +
+      " admissions",
+    async () => {
+      const a = history.trackPendingRequest(GLM_MODEL, GLM_PROVIDER, indexed ? CONN : null, true, {
+        clientRequest: { attempt: "A" },
+      });
+      const b = history.trackPendingRequest(GLM_MODEL, GLM_PROVIDER, indexed ? CONN : null, true, {
+        clientRequest: { attempt: "B" },
+      });
+      const bytes = history.getPendingRetainedBytes();
+      const wire =
+        GLM_PARTIAL_WIRE +
+        'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"GLM translated failure"}}\n\n';
+      const translated = translateSseResponse(
+        new Response(wire, { headers: { "content-type": "text/event-stream" } }),
+        GLM_PROVIDER,
+        GLM_MODEL
+      );
+      await assert.rejects(translated.text(), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /GLM translated failure/);
+        assert.notEqual(
+          (error as Error & Record<string, unknown>)[PENDING_REQUEST_CLEARED_MARKER],
+          true
+        );
+        return true;
+      });
+      assert.equal(history.getPendingRequests().byModel[GLM_KEY], 2);
+      assert.equal(history.getPendingRetainedBytes(), bytes);
+      if (a && b) {
+        assert.ok(history.getPendingById().has(a));
+        assert.ok(history.getPendingById().has(b));
+        assert.equal(history.getPendingRequests().byAccount[CONN]?.[GLM_KEY], 2);
+      }
+    }
+  );
+}

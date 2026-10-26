@@ -1,5 +1,7 @@
 import { trackPendingRequest } from "@/lib/usageDb";
-import type { PendingRequestIdentity } from "@/lib/usage/usageHistory";
+import type { PendingRequestIdentity } from "@/lib/usageDb";
+
+export type { PendingRequestIdentity, PendingRequestOwner } from "@/lib/usageDb";
 
 export type PendingCleanup = {
   model: string | null;

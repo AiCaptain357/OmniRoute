@@ -196,8 +196,12 @@ import { logAuditEvent } from "@/lib/compliance";
 import { emit } from "@/lib/events/eventBus";
 import { adaptBodyForCompression } from "../services/compression/bodyAdapter.ts";
 import { handleBypassRequest } from "../utils/bypassHandler.ts";
-import { saveRequestUsage, trackPendingRequest, appendRequestLog } from "@/lib/usageDb";
-import { capturePendingRequestOwner } from "@/lib/usage/usageHistory";
+import {
+  saveRequestUsage,
+  trackPendingRequest,
+  appendRequestLog,
+  capturePendingRequestOwner,
+} from "@/lib/usageDb";
 import {
   finalizePendingScope,
   initialPendingBody,
