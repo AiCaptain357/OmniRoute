@@ -1,0 +1,1 @@
+- **fix(usage):** Release terminal pending requests even when completion bookkeeping or completed-detail retention throws, preserving concurrent requests and their counters.

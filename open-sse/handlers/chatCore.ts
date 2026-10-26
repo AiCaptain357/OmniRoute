@@ -197,6 +197,7 @@ import { emit } from "@/lib/events/eventBus";
 import { adaptBodyForCompression } from "../services/compression/bodyAdapter.ts";
 import { handleBypassRequest } from "../utils/bypassHandler.ts";
 import { saveRequestUsage, trackPendingRequest, appendRequestLog } from "@/lib/usageDb";
+import { capturePendingRequestOwner } from "@/lib/usage/usageHistory";
 import {
   finalizePendingScope,
   initialPendingBody,
@@ -754,6 +755,9 @@ async function handleChatCoreInner({
       correlationId,
       sessionTag: conversationId || null,
     }) || generateRequestId();
+  const pendingRequestOwner = pendingConnId
+    ? capturePendingRequestOwner(pendingRequestId)
+    : undefined;
 
   // Initialize rate limit settings from persisted DB (once, lazy)
   await initializeRateLimits();
@@ -1044,6 +1048,7 @@ async function handleChatCoreInner({
   });
   const pendingScope = {
     id: pendingRequestId,
+    owner: pendingRequestOwner,
     model,
     provider,
     connectionId: pendingConnId,
@@ -1126,7 +1131,7 @@ async function handleChatCoreInner({
       headers: clientRawRequest?.headers ?? null,
     })
   ) {
-    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
     return createErrorResult(
       HTTP_STATUS.BAD_REQUEST,
       "Reasoning continuation is not compatible with the selected target"
@@ -1971,7 +1976,7 @@ async function handleChatCoreInner({
     log,
   });
   if (outputBudget.ok === false) {
-    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
     return createErrorResult(
       HTTP_STATUS.BAD_REQUEST,
       outputBudget.message,
@@ -2247,7 +2252,7 @@ async function handleChatCoreInner({
       apiKeyInfo,
       log,
     });
-    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
     return result;
   }
 
@@ -2326,7 +2331,7 @@ async function handleChatCoreInner({
     model
   );
   if (toolCallingCheck.blocked) {
-    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
     return createErrorResult(400, toolCallingCheck.message!, null, "tool_calling_not_supported");
   }
 
@@ -2369,7 +2374,7 @@ async function handleChatCoreInner({
     comboStepId,
     comboExecutionKey,
     finalizePendingRequest: () =>
-      trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId),
+      trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId),
     log,
   });
   if (quotaShareBlockResult) return quotaShareBlockResult;
@@ -2383,7 +2388,7 @@ async function handleChatCoreInner({
     if (!fit.compatible) {
       const msg = buildCapabilityMismatchMessage(fit.terminalReason!, provider, effectiveModel);
       log?.warn?.("CAPABILITY", msg);
-      trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+      trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
       return createErrorResult(400, msg, null, fit.terminalReason, "invalid_request_error");
     }
   }
@@ -2535,7 +2540,7 @@ async function handleChatCoreInner({
             : `${tokenBreach.scopeType} "${tokenBreach.scopeValue}"`;
         // FIX 6: clear the pending request marker before the early return so we do
         // not leak a phantom pending request (start was tracked at line ~1847).
-        trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+        trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
         // FIX 5: tag this as a per-API-key token-limit breach (errorCode
         // TOKEN_LIMIT_EXCEEDED) so the combo loop can distinguish it from an
         // upstream 429 and NOT cool shared accounts / retry it transiently.
@@ -2560,7 +2565,7 @@ async function handleChatCoreInner({
   if (provider === "gemini") {
     try {
       if (isTpmExhausted(effectiveModel)) {
-        trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+        trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestOwner ?? pendingRequestId);
         const rejected = createErrorResult(
           HTTP_STATUS.RATE_LIMITED,
           `Gemini TPM rate limit reached for ${effectiveModel}. Please try again later.`,
@@ -3326,6 +3331,7 @@ async function handleChatCoreInner({
     onStreamFailure,
     pendingConnId,
     pendingRequestId,
+    pendingRequestOwner,
     persistAttemptLogs,
     persistFailureUsage,
     pipelineSessionId,
