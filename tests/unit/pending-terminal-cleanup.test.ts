@@ -1557,43 +1557,68 @@ for (const indexed of [false, true]) {
   }
 }
 
+// #18094: once content was forwarded, a failure keeps its queued error terminal
+// for the reader and ends the stream instead of rejecting it; a failure before
+// any content still rejects. Neither path may claim the outer pending cleanup.
 for (const indexed of [false, true]) {
-  test(
-    "GLM transport error leaves outer cleanup unclaimed for " +
-      (indexed ? "indexed" : "model-only") +
-      " admissions",
-    async () => {
-      const a = history.trackPendingRequest(GLM_MODEL, GLM_PROVIDER, indexed ? CONN : null, true, {
-        clientRequest: { attempt: "A" },
-      });
-      const b = history.trackPendingRequest(GLM_MODEL, GLM_PROVIDER, indexed ? CONN : null, true, {
-        clientRequest: { attempt: "B" },
-      });
-      const bytes = history.getPendingRetainedBytes();
-      const wire =
-        GLM_PARTIAL_WIRE +
-        'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"GLM translated failure"}}\n\n';
-      const translated = translateSseResponse(
-        new Response(wire, { headers: { "content-type": "text/event-stream" } }),
-        GLM_PROVIDER,
-        GLM_MODEL
-      );
-      await assert.rejects(translated.text(), (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.match(error.message, /GLM translated failure/);
-        assert.notEqual(
-          (error as Error & Record<string, unknown>)[PENDING_REQUEST_CLEARED_MARKER],
-          true
+  for (const afterContent of [true, false]) {
+    test(
+      "GLM transport error " +
+        (afterContent ? "after content" : "before content") +
+        " leaves outer cleanup unclaimed for " +
+        (indexed ? "indexed" : "model-only") +
+        " admissions",
+      async () => {
+        const a = history.trackPendingRequest(
+          GLM_MODEL,
+          GLM_PROVIDER,
+          indexed ? CONN : null,
+          true,
+          {
+            clientRequest: { attempt: "A" },
+          }
         );
-        return true;
-      });
-      assert.equal(history.getPendingRequests().byModel[GLM_KEY], 2);
-      assert.equal(history.getPendingRetainedBytes(), bytes);
-      if (a && b) {
-        assert.ok(history.getPendingById().has(a));
-        assert.ok(history.getPendingById().has(b));
-        assert.equal(history.getPendingRequests().byAccount[CONN]?.[GLM_KEY], 2);
+        const b = history.trackPendingRequest(
+          GLM_MODEL,
+          GLM_PROVIDER,
+          indexed ? CONN : null,
+          true,
+          {
+            clientRequest: { attempt: "B" },
+          }
+        );
+        const bytes = history.getPendingRetainedBytes();
+        const wire =
+          (afterContent ? GLM_PARTIAL_WIRE : "") +
+          'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"GLM translated failure"}}\n\n';
+        const translated = translateSseResponse(
+          new Response(wire, { headers: { "content-type": "text/event-stream" } }),
+          GLM_PROVIDER,
+          GLM_MODEL
+        );
+        if (afterContent) {
+          const text = await translated.text();
+          assert.match(text, /actual GLM answer/);
+          assert.match(text, /"error":\{"message":"GLM translated failure"/);
+        } else {
+          await assert.rejects(translated.text(), (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.match(error.message, /GLM translated failure/);
+            assert.notEqual(
+              (error as Error & Record<string, unknown>)[PENDING_REQUEST_CLEARED_MARKER],
+              true
+            );
+            return true;
+          });
+        }
+        assert.equal(history.getPendingRequests().byModel[GLM_KEY], 2);
+        assert.equal(history.getPendingRetainedBytes(), bytes);
+        if (a && b) {
+          assert.ok(history.getPendingById().has(a));
+          assert.ok(history.getPendingById().has(b));
+          assert.equal(history.getPendingRequests().byAccount[CONN]?.[GLM_KEY], 2);
+        }
       }
-    }
-  );
+    );
+  }
 }
