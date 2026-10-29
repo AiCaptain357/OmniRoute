@@ -112,6 +112,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     extractSessionAffinityKey,
     extractUsageFromResponse,
     finalBody: _finalBody,
+    geminiPromptCacheMode,
     finalizePendingScope,
     getCurrentConnectionId,
     getManagedLeaseFenceErrorCode,
@@ -127,6 +128,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     injectionResult,
     isCombo,
     isJsonRecord,
+    isScopedGeminiCacheTarget,
     isLocalStreamLifecycleError,
     isSemaphoreCapacityError,
     isServerOwnedToolLoopEnabled,
@@ -198,6 +200,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     requestToolIdentityMap,
     stream,
     toolNameMap,
+    tokensCompressed,
     traceEnabled,
     videoBridgeObserved,
   } = deps;
@@ -686,7 +689,15 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       usage,
       toolLoopUsage != null
     );
-    const cacheUsageLogMeta = buildCacheUsageLogMeta(usage);
+    const cacheUsageLogMeta = buildCacheUsageLogMeta(
+      usage,
+      isScopedGeminiCacheTarget
+        ? {
+            mode: geminiPromptCacheMode,
+            compressionTokens: tokensCompressed || undefined,
+          }
+        : undefined
+    );
     if (usage && typeof usage === "object") {
       attachCompressionUsageReceiptAfterAnalytics(usage as Record<string, unknown>, "provider");
       if (provider === "gemini") {
@@ -816,6 +827,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         clientResponse: buildErrorBody(HTTP_STATUS.BAD_REQUEST, guardrailMessage),
         claudeCacheMeta: claudePromptCacheLogMeta,
         claudeCacheUsageMeta: cacheUsageLogMeta,
+        geminiPromptCache: cacheUsageLogMeta?.geminiPromptCache,
         cacheSource: "upstream",
       });
       recordChatCallCost(
@@ -914,6 +926,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         clientResponse: malformedClientBody,
         claudeCacheMeta: claudePromptCacheLogMeta,
         claudeCacheUsageMeta: cacheUsageLogMeta,
+        geminiPromptCache: cacheUsageLogMeta?.geminiPromptCache,
         cacheSource: "upstream",
       });
       persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "malformed_translated_response");
@@ -944,6 +957,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           status: HTTP_STATUS.BAD_GATEWAY,
           finishReason: routingFinishReason(translatedResponse),
           connectionId: credentials?.connectionId ?? null,
+          apiKeyId: apiKeyInfo?.id ?? null,
         })
       );
       return {
@@ -1004,6 +1018,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       clientResponse: translatedResponse,
       claudeCacheMeta: claudePromptCacheLogMeta,
       claudeCacheUsageMeta: cacheUsageLogMeta,
+      geminiPromptCache: cacheUsageLogMeta?.geminiPromptCache,
       cacheSource: "upstream",
     });
     recordChatCallCost(
@@ -1103,6 +1118,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         status: 200,
         finishReason: routingFinishReason(translatedResponse),
         connectionId: credentials?.connectionId ?? null,
+        apiKeyId: apiKeyInfo?.id ?? null,
       })
     );
 

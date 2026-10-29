@@ -837,11 +837,13 @@ async function captureLogger(id: string) {
   logger.appendProviderChunk("captured provider fixture ".repeat(256));
   logger.appendOpenAIChunk("captured intermediate fixture");
   logger.appendConvertedChunk("captured client fixture");
+  // Pending entries hold an owned snapshot synced at a byte threshold or on flush
+  // (#17282), so read the pipeline payloads first to flush the capture.
+  assert.ok(logger.getPipelinePayloads()?.streamChunks?.client?.length);
   assert.match(
     history.getPendingById().get(id)?.streamChunks?.provider?.[0] ?? "",
     /captured provider fixture/
   );
-  assert.ok(logger.getPipelinePayloads()?.streamChunks?.client?.length);
   return logger;
 }
 
@@ -854,6 +856,7 @@ for (const failure of ["none", "storage", "scheduling"] as const) {
     const providerResponse = { content: "updated provider preview".repeat(10) };
     assert.equal(history.updatePendingRequestById(terminal, { providerResponse }), true);
     logger.appendProviderChunk("captured after the first preview update".repeat(64));
+    assert.equal(logger.getPipelinePayloads()?.streamChunks?.provider?.length, 2);
     const clientResponse = { content: "updated client preview".repeat(20) };
     history.updatePendingRequest(MODEL, PROVIDER, CONN, { clientResponse });
     const detail = history.getPendingById().get(terminal);
