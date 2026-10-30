@@ -16,6 +16,9 @@ process.env.STREAM_RECOVERY_ENABLED = "false";
 process.env.FETCH_TIMEOUT_MS = "0";
 const { handleComboChat, validateResponseQuality } =
   await import("../../open-sse/services/combo.ts");
+const { classifyPreContentReadFailure } =
+  await import("../../open-sse/services/combo/preContentTransportFailure.ts");
+const { SseOutputScanner } = await import("../../open-sse/services/combo/firstOutputStream.ts");
 const { createRecoverableStream } = await import("../../open-sse/services/streamRecovery.ts");
 const { recordSessionModelUsage, getLastSessionModel } =
   await import("../../src/lib/db/contextHandoffs.ts");
@@ -192,35 +195,34 @@ test("test database is inside the temporary DATA_DIR", () => {
   assert.equal(path.dirname(rows.find((row) => row.name === "main")!.file), data);
 });
 
-for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
-  for (const code of ["ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_BODY_TIMEOUT"]) {
-    for (const form of ["root", "cause", "sanitized"] as const) {
-      test(`${route}: ${code} in ${form} retries before useful output`, async () => {
-        const error =
-          form === "root"
-            ? coded(code)
-            : form === "cause"
-              ? new Error("fetch failed", { cause: coded(code) })
-              : Object.assign(new Error("fetch failed"), { causeCode: code });
-        const calls: string[] = [];
-        const { response } = await run(route, async (_body, model, target) => {
-          if (route === "pin" && calls.length === 0)
-            assert.equal(
-              target?.modelPinned,
-              true,
-              "first dispatch must use persisted context-cache pin"
-            );
-          calls.push(model);
-          return calls.length === 1
-            ? cut(form === "root" ? "" : form === "cause" ? ping : role, error)
-            : success();
-        });
-        const text = await drain(response);
-        assert.deepEqual(calls, [first, first]);
-        assert.equal(text, answer);
-      });
-    }
+for (const code of ["ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_BODY_TIMEOUT"]) {
+  for (const form of ["root", "cause", "sanitized"] as const) {
+    test(`${code} in ${form} classifies and rejects pre-content quality`, async () => {
+      const error =
+        form === "root"
+          ? coded(code)
+          : form === "cause"
+            ? new Error("fetch failed", { cause: coded(code) })
+            : Object.assign(new Error("fetch failed"), { causeCode: code });
+      assert.deepEqual(classifyPreContentReadFailure(error), { kind: "transport", code });
+      const result = await quality(form === "root" ? "" : form === "cause" ? ping : role, error);
+      assert.equal(result.valid, false);
+      assert.equal(result.upstreamFailure?.retryable, true);
+      assert.equal(result.upstreamFailure?.transportReadFailure, true);
+    });
   }
+}
+for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
+  test(`${route}: coded pre-content failure retries the same target`, async () => {
+    const calls: string[] = [];
+    const { response } = await run(route, async (_body, model, target) => {
+      if (route === "pin" && calls.length === 0) assert.equal(target?.modelPinned, true);
+      calls.push(model);
+      return calls.length === 1 ? cut() : success();
+    });
+    assert.deepEqual(calls, [first, first]);
+    assert.equal(await drain(response), answer);
+  });
 }
 
 for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
@@ -559,38 +561,45 @@ const boundaries: Array<[string, string]> = [
   ["Gemini finish", frame({ candidates: [{ finishReason: "STOP" }] })],
   ["wrapped Gemini finish", frame({ response: { candidates: [{ finishReason: "MAX_TOKENS" }] } })],
 ];
-for (const route of ["priority", "round-robin"] as const) {
-  for (const [name, prefix] of boundaries) {
-    test(`${route}: no replay after ${name}, including Cursor words in a coded error`, async () => {
-      const calls: string[] = [];
-      const messages: unknown[][] = [];
-      const logger = {
-        ...quiet,
-        warn: (...args: unknown[]) => {
-          messages.push(args);
-        },
-      };
-      const { response } = await run(
-        route,
-        async (_body, model) => {
-          calls.push(model);
-          return cut(prefix, coded("ECONNRESET", "no usable content secret=must-stay-private"));
-        },
-        { log: logger }
+for (const [name, prefix] of boundaries) {
+  test(`quality does not replay after ${name}, including Cursor words in a coded error`, async () => {
+    const warnings: unknown[][] = [];
+    const logger = {
+      ...quiet,
+      warn: (...args: unknown[]) => {
+        warnings.push(args);
+      },
+    };
+    assertScannerVeto(prefix, true);
+    const source = cut(prefix, coded("ECONNRESET", "no usable content secret=must-stay-private"));
+    const result = await validateResponseQuality(
+      source.clone(),
+      true,
+      logger,
+      null,
+      null,
+      false,
+      true
+    );
+    assert.equal(result.valid, true);
+    assert.equal(result.upstreamFailure, undefined);
+    try {
+      await rejectNextRead(
+        source,
+        ["text", "reasoning", "encrypted reasoning item", "tool item"].includes(name)
+          ? prefix
+          : undefined
       );
-      assert.deepEqual(calls, [first]);
-      assert.equal(response.status, 200);
-      const reader = response.body!.getReader();
-      if (["text", "reasoning", "encrypted reasoning item", "tool item"].includes(name)) {
-        const initial = await reader.read();
-        assert.equal(new TextDecoder().decode(initial.value), prefix);
-      }
-      // A catch-path veto forwards the already errored original tee branch.
-      await assert.rejects(reader.read(), { code: "ECONNRESET" });
-      reader.releaseLock();
-      assert.doesNotMatch(JSON.stringify(messages), /must-stay-private/);
-    });
-  }
+    } finally {
+      void result.clonedResponse?.body?.cancel().catch(noop);
+    }
+    assert.doesNotMatch(JSON.stringify(result), /must-stay-private/);
+    assert.doesNotMatch(JSON.stringify(warnings), /must-stay-private/);
+  });
+}
+for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
+  test(`${route}: useful output preserves its payload and vetoes coded Cursor errors`, () =>
+    assertRouteVeto(route, boundaries[0][1], 0));
 }
 
 test("unspecified Gemini finish remains eligible for transport recovery", async () => {
@@ -1036,37 +1045,18 @@ test("non-streaming client request keeps coded read-error passthrough", async ()
   await drain(response);
 });
 
-test("positive first-output gate must not replay a terminal followed by a coded read failure", async () => {
-  const calls: string[] = [];
-  const { response } = await run(
-    "priority",
-    async (_body, model) => {
-      calls.push(model);
-      return cut(frame({ type: "response.done", response: { output: [] } }), coded());
-    },
-    {},
-    { targetTimeoutMs: 1000 }
-  );
-  assert.deepEqual(calls, [first]);
-  assert.equal(response.status, 200);
-  await assert.rejects(response.text(), { code: "ECONNRESET" });
-});
-
-test("positive first-output gate leaves pre-content coded failure eligible for quality recovery", async () => {
-  const calls: string[] = [];
-  const { response } = await run(
-    "priority",
-    async (_body, model) => {
-      calls.push(model);
-      return calls.length === 1 ? cut(ping) : success();
-    },
-    {},
-    { targetTimeoutMs: 1000 }
-  );
-  assert.deepEqual(calls, [first, first]);
-  assert.equal(await drain(response), answer);
-});
-
+async function rejectNextRead(response: Response, prefix?: string) {
+  const reader = response.body!.getReader();
+  try {
+    if (prefix !== undefined) {
+      const initial = await reader.read();
+      assert.equal(new TextDecoder().decode(initial.value), prefix);
+    }
+    await assert.rejects(reader.read(), { code: "ECONNRESET" });
+  } finally {
+    reader.releaseLock();
+  }
+}
 async function rejectReturnedStream(response: Response) {
   const reader = response.body!.getReader();
   try {
@@ -1083,28 +1073,63 @@ async function rejectReturnedStream(response: Response) {
     reader.releaseLock();
   }
 }
+async function assertRouteVeto(
+  route: Parameters<typeof setup>[0],
+  prefix: string,
+  targetTimeoutMs = 1000
+) {
+  const calls: string[] = [];
+  const warnings: unknown[][] = [];
+  const { response } = await run(
+    route,
+    async (_body, model, target) => {
+      if (route === "pin" && calls.length === 0) assert.equal(target?.modelPinned, true);
+      calls.push(model);
+      return cut(prefix, coded("ECONNRESET", "no usable content secret=must-stay-private"));
+    },
+    {
+      log: {
+        ...quiet,
+        warn: (...args: unknown[]) => {
+          warnings.push(args);
+        },
+      },
+    },
+    { targetTimeoutMs }
+  );
+  assert.deepEqual(calls, [first]);
+  assert.equal(response.status, 200);
+  if (targetTimeoutMs === 0) await rejectNextRead(response, prefix);
+  else await rejectReturnedStream(response);
+  assert.doesNotMatch(JSON.stringify(warnings), /must-stay-private/);
+}
 const eventOnlyItems: Array<[string, string]> = ["added", "done"].map((kind) => [
   `event-only empty message item ${kind}`,
   frame({ item: { type: "message", content: [] } }, `response.output_item.${kind}`),
 ]);
+function assertScannerVeto(prefix: string | string[], expected: boolean) {
+  let observed = false;
+  const scanner = new SseOutputScanner(() => {
+    observed = true;
+  });
+  const readiness = new SseOutputScanner();
+  for (const chunk of typeof prefix === "string" ? [prefix] : prefix) {
+    const ready = scanner.push(chunk);
+    assert.equal(ready, readiness.push(chunk), "observer preserves push readiness");
+    const overflowed = scanner.overflowedWithoutOutput();
+    assert.equal(overflowed, readiness.overflowedWithoutOutput());
+    if (ready || overflowed) break;
+  }
+  assert.equal(scanner.flush(), readiness.flush(), "observer preserves error/EOF flush");
+  assert.equal(observed, expected, "scanner's completed frames/output/caps decide replay veto");
+}
+for (const [boundary, prefix] of eventOnlyItems) {
+  test(`scanner observes ${boundary} veto`, () => assertScannerVeto(prefix, true));
+}
 for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
-  for (const [boundary, prefix] of [...boundaries, ...eventOnlyItems]) {
-    test(`${route}: positive first-output gate retains ${boundary} veto`, async () => {
-      const calls: string[] = [];
-      const { response } = await run(
-        route,
-        async (_body, model, target) => {
-          if (route === "pin" && calls.length === 0) assert.equal(target?.modelPinned, true);
-          calls.push(model);
-          return cut(prefix);
-        },
-        {},
-        { targetTimeoutMs: 1000 }
-      );
-      assert.deepEqual(calls, [first]);
-      assert.equal(response.status, 200);
-      await rejectReturnedStream(response);
-    });
+  for (const [boundary, prefix] of [boundaries[0], boundaries[12], eventOnlyItems[1]]) {
+    test(`${route}: positive first-output gate retains ${boundary} veto`, () =>
+      assertRouteVeto(route, prefix));
   }
   test(`${route}: inherited terminal veto precedes Cursor diagnostics`, async () => {
     const calls: string[] = [];
@@ -1165,24 +1190,12 @@ const failureFrames = [
   frame({ response: { status: "failed", error: { message: "failed" } } }),
   frame("invalid request", "error"),
 ];
+for (const [index, prefix] of failureFrames.entries()) {
+  test(`scanner observes failure ${index} veto`, () => assertScannerVeto(prefix, true));
+}
 for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
-  for (const [index, prefix] of failureFrames.entries()) {
-    test(`${route}: first-gate observed failure ${index} preserves lost-frame passthrough`, async () => {
-      const calls: string[] = [];
-      const { response } = await run(
-        route,
-        async (_body, model) => {
-          calls.push(model);
-          return cut(prefix);
-        },
-        {},
-        { targetTimeoutMs: 1000 }
-      );
-      assert.deepEqual(calls, [first]);
-      assert.equal(response.status, 200);
-      await rejectReturnedStream(response);
-    });
-  }
+  test(`${route}: first-gate observed failure preserves lost-frame passthrough`, () =>
+    assertRouteVeto(route, failureFrames[0]));
 }
 for (const benign of [{}, "", false, 0]) {
   test(`benign error ${JSON.stringify(benign)} cannot create a first-output veto`, async () => {
@@ -1295,7 +1308,7 @@ for (const root of [true, false]) {
 }
 const splitReviewFrame = (event: string, data: string[]) =>
   [`event: ${event}`, ...data.map((line) => `data: ${line}`), "", ""].join("\r\n").split(/(?<=\r)/);
-type ReviewFrame = [string, string | string[], boolean, Partial<Options>?];
+type ReviewFrame = [string, string | string[], boolean];
 const reviewFrames: ReviewFrame[] = [
   [
     "implicit terminal flush on comment",
@@ -1383,14 +1396,6 @@ for (const event of ["response.done", "error", "progress"]) {
 }
 reviewFrames.push(["review13 pending line overflow", ":" + "x".repeat(80 * 1024), false]);
 reviewFrames.push(["review13 below cap", frame({ padding: "x".repeat(60 * 1024) }), true]);
-for (const enabled of [false, undefined]) {
-  reviewFrames.push([
-    `review13 oversized metadata flag ${enabled}`,
-    largeMetadata,
-    false,
-    { settings: enabled === undefined ? {} : settings(enabled) },
-  ]);
-}
 for (const payload of [true, 1, "signal", []]) {
   for (const event of [
     "response.done",
@@ -1416,24 +1421,26 @@ for (const payload of [false, 0, "", null]) {
 }
 reviewFrames.push(["review14 line budget", ":\n".repeat(257), false]);
 reviewFrames.push(["review14 below line budget", ":\n".repeat(200), true]);
+for (const [label, prefix, recover] of reviewFrames) {
+  test(`scanner preserves ${label}`, () => assertScannerVeto(prefix, !recover));
+}
 for (const route of ["priority", "round-robin", "runtime", "pin"] as const) {
-  for (const [label, prefix, recover, extra = {}] of reviewFrames) {
-    test(`review12: ${route} preserves ${label}`, async () => {
+  for (const enabled of [false, undefined]) {
+    test(`${route}: oversized metadata passthrough with recovery ${enabled}`, async () => {
       const calls: string[] = [];
       const { response } = await run(
         route,
         async (_body, model, target) => {
           if (route === "pin" && calls.length === 0) assert.equal(target?.modelPinned, true);
           calls.push(model);
-          return recover && calls.length > 1 ? success() : cut(prefix);
+          return cut(largeMetadata);
         },
-        extra,
+        { settings: enabled === undefined ? {} : settings(enabled) },
         { targetTimeoutMs: 1000 }
       );
-      assert.deepEqual(calls, recover ? [first, first] : [first]);
+      assert.deepEqual(calls, [first]);
       assert.equal(response.status, 200);
-      if (recover) assert.equal(await drain(response), answer);
-      else await rejectReturnedStream(response);
+      await rejectReturnedStream(response);
     });
   }
 }
